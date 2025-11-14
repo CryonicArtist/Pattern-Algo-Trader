@@ -57,15 +57,15 @@ end
 
 %% 3. Define Strategy Parameters
 % --- Indicator Parameters ---
-strat.smaFastPeriod = 50;        % Fast SMA window
-strat.smaSlowPeriod = 200;       % Slow SMA window
+strat.smaFastPeriod = 50;        % Fast SMA window (was 10)
+strat.smaSlowPeriod = 200;       % Slow SMA window (was 30)
 strat.rsiPeriod     = 14;        % RSI lookback period
-strat.rsiOverbought = 70;        % RSI overbought threshold
-strat.rsiOversold   = 30;        % RSI oversold threshold
+strat.rsiOverbought = 70;        % RSI overbought threshold (was 60)
+strat.rsiOversold   = 30;        % RSI oversold threshold (was 40)
 
 % --- YOLO Model Parameters ---
 strat.yoloChartWindow = 100;     % e.g., use 100 bars to generate the chart
-strat.yoloConfidence  = 0.80;    % Minimum confidence to trust a pattern
+strat.yoloConfidence  = 0.80;    % Minimum confidence to trust a pattern (was 0.50)
 strat.yoloImgSize     = [640 640]; % Input size for the YOLO model
 
 %% 3.5 Load Deep Learning Model
@@ -226,19 +226,20 @@ for i = 2:numPoints
     % --- End of YOLO Logic ---
 
     
-    % --- [NEW] Combine Signals *Inside the Loop* ---
-    % This is your "secret sauce".
-    finalBuy = smaBuySignal(i) | rsiBuySignal(i) | patternBuy;
-    finalSell = smaSellSignal(i) | rsiSellSignal(i) | patternSell;
-
-    % Ensure we don't buy and sell on the same bar
-    if finalBuy && finalSell
-        finalBuy = 0;
-        finalSell = 0;
-    end
+    % --- [NEW] Trend-Following Logic ---
     
+    % Define the overall trend. We only act if SMAs are valid.
+    isBullTrend = false;
+    if ~isnan(smaFast(i)) && ~isnan(smaSlow(i))
+        isBullTrend = (smaFast(i) > smaSlow(i));
+    end
+
     % --- Check for Exit (Sell) Signal ---
     if position == 1 % We are currently in a long position
+        
+        % EXIT RULE: Only exit on a "Death Cross"
+        finalSell = smaSellSignal(i);
+        
         if finalSell == 1
             % Sell! (Go flat)
             position = 0;
@@ -247,6 +248,12 @@ for i = 2:numPoints
         
     % --- Check for Entry (Buy) Signal ---
     elseif position == 0 % We are currently flat
+        
+        % ENTRY RULE:
+        % 1. The main "Golden Cross" signal
+        % 2. OR, if already in a bull trend, buy on a dip (RSI or Pattern)
+        finalBuy = smaBuySignal(i) | (isBullTrend & (rsiBuySignal(i) | patternBuy));
+        
         if finalBuy == 1
             % Buy! (Go long)
             position = 1;
