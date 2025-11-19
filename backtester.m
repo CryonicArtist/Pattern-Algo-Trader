@@ -1,397 +1,144 @@
-% ---
-% Title: Event-Driven MATLAB Backtester for SMA, RSI, and YOLOv8
-% Author: Gemini
-% Date: 14-Nov-2025
-%
-% Description:
-% This script provides an event-driven backtesting framework in MATLAB.
-% It is designed to test a trading strategy that combines signals from:
-% 1. Simple Moving Average (SMA) Crossover (Vectorized)
-% 2. Relative Strength Index (RSI) (Vectorized)
-% 3. A live pattern-detection model (YOLOv8) processed in the loop.
-%
-% This script uses built-in MATLAB data for demonstration purposes.
-%
-% Disclaimer: FOR EDUCATIONAL PURPOSES ONLY. NOT FINANCIAL ADVICE.
-% ---
+%% MATLAB Realistic P/E Algo Trader
+% Strategy: Buy when Price-to-Earnings (P/E) is historically low.
+%           Sell when P/E is historically high.
+% NO "God Mode" - The bot trades based on public Earnings data only.
 
-%% 1. Setup Environment
-clear;         % Clear workspace
-clc;           % Clear command window
-close all;     % Close all figures
+clear; clc; close all;
 
-%% 2. Load and Prepare Data
-% We will use a built-in dataset (Dow Jones Industrial) to make this
-% script runnable for anyone.
-% You can replace this section with your own data loader (e.g., readtable).
+%% --- 1. PARAMETERS & DATA GENERATION ---
+days = 252 * 5;      % 5 Years
+start_earn = 5.00;   % Starting Earnings Per Share (EPS)
+avg_pe = 20;         % The "Fair" P/E Ratio
+volatility = 0.02;   % Volatility of the company earnings
 
-try
-    % Load sample 'Data_GlobalIdx.mat' which contains 'dates' and 'ind'
-    load('Data_GlobalIdx.mat');
+% Pre-allocate
+dates = (1:days)';
+earnings = zeros(days, 1);
+market_price = zeros(days, 1);
+pe_ratios = zeros(days, 1);
+
+% Initialize
+earnings(1) = start_earn;
+% Market starts at "Fair Value"
+market_price(1) = start_earn * avg_pe; 
+pe_ratios(1) = avg_pe;
+
+% Generate Data
+rng('shuffle'); 
+current_pe_sentiment = avg_pe; % Starts at 20
+
+for t = 2:days
+    % 1. Generate Earnings (Random Walk with slight upward drift)
+    % Earnings grow slowly (0.05% per day) but have noise
+    earnings(t) = earnings(t-1) * (1 + 0.0005 + randn * 0.01); 
     
-    % Convert date numbers to datetime objects
-    priceDates = datetime(dates, 'ConvertFrom', 'datenum');
+    % 2. Generate Market Sentiment (P/E Ratio)
+    % Sentiment swings like a pendulum around the average of 20
+    sentiment_shock = randn * 0.5; 
+    % Mean reversion strength (pulls P/E back to 20)
+    pull_back = (avg_pe - current_pe_sentiment) * 0.05; 
+    current_pe_sentiment = current_pe_sentiment + pull_back + sentiment_shock;
     
-    % The data has 5 columns: [Open, High, Low, Close, Volume]
-    % We need all of ind(:, 1:4) for the candle plot
-    ohlc_data = ind(:, 1:4); % Open, High, Low, Close
-    prices = ohlc_data(:, 4); % Close prices
-    
-    % Clean data: Remove any NaN rows from ohlc data, prices, and dates
-    nanRows = any(isnan(ohlc_data), 2) | isnan(prices); % Check for NaNs
-    prices = prices(~nanRows);
-    ohlc_data = ohlc_data(~nanRows, :); % Keep the full, clean OHLC data
-    priceDates = priceDates(~nanRows);
-    
-    fprintf('Loaded and prepared %d data points.\n', length(prices));
-catch
-    warning('Could not load sample data. Generating synthetic data.');
-    prices = 100 + cumsum(randn(1000, 1) * 0.5) + sin((1:1000)'/50) * 5;
-    priceDates = datetime('2020-01-01') + caldays(0:999);
-    % Generate dummy OHLC data for the catch block
-    ohlc_data = [prices, prices + randn(1000,1), prices - randn(1000,1), prices];
-    % Ensure O,H,L,C logic (H >= O,C and L <= O,C)
-    ohlc_data(:,2) = max(ohlc_data(:,1), ohlc_data(:,4)); % High
-    ohlc_data(:,3) = min(ohlc_data(:,1), ohlc_data(:,4)); % Low
+    % 3. Calculate Price
+    % Price = Earnings * P/E Ratio
+    market_price(t) = earnings(t) * current_pe_sentiment;
+    pe_ratios(t) = current_pe_sentiment;
 end
 
-%% 3. Define Strategy Parameters
-% --- Indicator Parameters ---
-strat.smaFastPeriod = 50;        % Fast SMA window (was 10)
-strat.smaSlowPeriod = 200;       % Slow SMA window (was 30)
-strat.rsiPeriod     = 14;        % RSI lookback period
-strat.rsiOverbought = 70;        % RSI overbought threshold (was 60)
-strat.rsiOversold   = 30;        % RSI oversold threshold (was 40)
+%% --- 2. STRATEGY (REALISTIC) ---
+initial_capital = 10000;
+capital = initial_capital;
+position = 0; 
+commission = 5; 
 
-% --- YOLO Model Parameters ---
-strat.yoloChartWindow = 100;     % e.g., use 100 bars to generate the chart
-strat.yoloConfidence  = 0.80;    % Minimum confidence to trust a pattern (was 0.50)
-strat.yoloImgSize     = [640 640]; % Input size for the YOLO model
+portfolio_value = zeros(days, 1);
+buy_signals = nan(days, 1);
+sell_signals = nan(days, 1);
+trade_log = [];
 
-%% 3.5 Load Deep Learning Model
-fprintf('Loading YOLOv8 model...\n');
-% ---
-% IMPORTANT:
-% 1. Generate the .onnx file using the 'convert_to_onnx.py' script.
-% 2. Install the "Deep Learning Toolbox Interface for YOLO v8" Add-On.
-%    (Home Tab -> Add-Ons -> Get Add-Ons -> Search "YOLO v8")
-% ---
-modelFile = 'model.onnx'; % <-- Name generated by Python script
-modelLoaded = false;
-if ~isfile(modelFile)
-    warning('YOLOv8 model file not found: %s', modelFile);
-    warning("Please run the 'convert_to_onnx.py' script to generate it.");
-else
-    try
-        % This function loads the ONNX file and creates a detector object
-        yoloDetector = yolov8("Model", modelFile);
-        modelLoaded = true;
-        fprintf('YOLOv8 detector loaded successfully.\n');
-    catch ME
-        warning('Could not load YOLOv8 detector.');
-        disp('Please ensure you have:');
-        disp('1. Deep Learning Toolbox');
-        disp('2. Deep Learning Toolbox Interface for YOLO v8 (Add-On)');
-        disp('3. The .onnx file in the correct path.');
-        disp('Error details:');
-        disp(ME.message);
-    end
-end
+% Estimated Fair Value (This is the Bot's "Prediction")
+% The bot assumes the stock is always worth 20x Earnings.
+estimated_fair_value = earnings * avg_pe;
 
-
-%% 4. Calculate Technical Indicators (Vectorized)
-% We pre-calculate the indicators that can be vectorized for speed.
-fprintf('Calculating technical indicators...\n');
-try
-    % Calculate Fast and Slow SMAs
-    smaFast = movavg(prices, 'simple', strat.smaFastPeriod);
-    smaSlow = movavg(prices, 'simple', strat.smaSlowPeriod);
+for t = 1:days
+    current_price = market_price(t);
+    my_fair_value = estimated_fair_value(t); % Earnings * 20
     
-    % Calculate RSI
-    rsi = rsindex(prices, strat.rsiPeriod);
-catch
-    error('Financial Toolbox not found. Cannot calculate movavg or rsindex.');
-end
-
-%% 5. Generate Vectorized Signals
-% We generate the signals for the vectorized indicators.
-% The pattern detection signal will be generated in the loop.
-
-% --- Initialize signal vectors ---
-numPoints = length(prices);
-smaBuySignal    = zeros(numPoints, 1);
-smaSellSignal   = zeros(numPoints, 1);
-rsiBuySignal    = zeros(numPoints, 1);
-rsiSellSignal   = zeros(numPoints, 1);
-
-% --- [FIX] Create lagged vectors to replace 'lag' function ---
-% This removes the dependency on the Econometrics Toolbox
-smaFast_lag = [NaN; smaFast(1:end-1)];
-smaSlow_lag = [NaN; smaSlow(1:end-1)];
-rsi_lag     = [NaN; rsi(1:end-1)];
-
-% --- SMA Crossover Signals ---
-sma_cross_up = (smaFast > smaSlow) & (smaFast_lag <= smaSlow_lag);
-sma_cross_down = (smaFast < smaSlow) & (smaFast_lag >= smaSlow_lag);
-smaBuySignal(sma_cross_up) = 1;   % Golden Cross
-smaSellSignal(sma_cross_down) = 1; % Death Cross
-
-% --- RSI Signals ---
-rsi_cross_up = (rsi < strat.rsiOversold) & (rsi_lag >= strat.rsiOversold);
-rsi_cross_down = (rsi > strat.rsiOverbought) & (rsi_lag <= strat.rsiOverbought);
-rsiBuySignal(rsi_cross_up) = 1;   % Entering oversold (buy signal)
-rsiSellSignal(rsi_cross_down) = 1; % Entering overbought (sell signal)
-
-
-%% 6. Run the Backtest (Event Loop)
-% This is the main loop where event-driven logic (YOLO) happens.
-fprintf('Running backtest...\n');
-
-% --- Pre-allocate vectors for performance ---
-position = 0; % 0 = flat, 1 = long
-positions = zeros(numPoints, 1); % Stores position for each day
-initialCapital = 10000;
-numTrades = 0;
-yoloErrors = 0; % To count YOLO errors
-
-% We must start from 2, as 'lag' calculations make day 1 unusable
-% (Our manual lag vectors with NaN handle this)
-for i = 2:numPoints
+    % Logic: 
+    % If Price is 15% below Fair Value (P/E < 17) -> BUY
+    % If Price is 15% above Fair Value (P/E > 23) -> SELL
     
-    % --- Initialize daily signals ---
-    patternBuy = 0;
-    patternSell = 0;
-
-    % --- [CRITICAL] YOLOv8 Pattern Detection (Live in loop) ---
-    if modelLoaded && (i >= strat.yoloChartWindow)
-        try
-            % a. Get data for the chart (O, H, L, C)
-            windowData = ohlc_data(i - strat.yoloChartWindow + 1 : i, :);
-            
-            % b. Generate the chart image (in memory)
-            f = figure('Visible', 'off', 'Units', 'pixels', 'Position', [0 0 strat.yoloImgSize]);
-            ax = gca; % Get current axes
-            
-            % candle(C, H, L, O) -
-            % Our data is ohlc_data = [O, H, L, C] -> [1, 2, 3, 4]
-            candle(windowData(:,4), windowData(:,2), windowData(:,3), windowData(:,1));
-            
-            % c. Clean the image (remove axes, labels, padding)
-            axis off;
-            set(ax, 'LooseInset', get(ax, 'TightInset')); % Remove all padding
-            
-            % d. Grab the frame
-            frame = getframe(ax);
-            img = frame.cdata;
-            close(f); % Close the hidden figure
-            
-            % e. Resize image (if figure size wasn't exact)
-            if size(img, 1) ~= strat.yoloImgSize(1) || size(img, 2) ~= strat.yoloImgSize(2)
-                 img = imresize(img, strat.yoloImgSize);
-            end
-
-            % f. Run detection
-            % We use a low threshold to catch all potential patterns
-            [bboxes, scores, labels] = detect(yoloDetector, img, 'ConfidenceThreshold', 0.1);
-            
-            % g. Parse results and set signals
-            for j = 1:length(labels)
-                if scores(j) >= strat.yoloConfidence
-                    % Note: Check the exact class names from your model
-                    % (e.g., "bullish_pattern" or "Bullish" or "head_and_shoulders")
-                    if labels(j) == "bullish_pattern" 
-                        patternBuy = 1;
-                    elseif labels(j) == "bearish_pattern"
-                        patternSell = 1;
-                    end
-                end
-            end
-            
-            % Optional: Display progress
-            % if mod(i, 100) == 0
-            %    fprintf('YOLO processed day %d\n', i);
-            % end
-            
-        catch ME_yolo
-            % Don't stop the backtest, just log the error and disable
-            yoloErrors = yoloErrors + 1;
-            if yoloErrors < 5 % Only warn a few times
-                warning('YOLO detection failed at day %d: %s', i, ME_yolo.message);
-            elseif yoloErrors == 5
-                warning('Disabling further YOLO detection due to repeated errors.');
-                modelLoaded = false; % Disable for rest of backtest
+    if position == 0
+        % Buy Deep Value
+        if current_price < (my_fair_value * 0.85) 
+            shares = floor((capital - commission) / current_price);
+            if shares > 0
+                cost = shares * current_price + commission;
+                capital = capital - cost;
+                position = shares;
+                buy_signals(t) = current_price;
+                trade_log = [trade_log; t, 1, current_price, pe_ratios(t)];
             end
         end
-    end
-    % --- End of YOLO Logic ---
-
-    
-    % --- [NEW] Trend-Following Logic ---
-    
-    % Define the overall trend. We only act if SMAs are valid.
-    isBullTrend = false;
-    if ~isnan(smaFast(i)) && ~isnan(smaSlow(i))
-        isBullTrend = (smaFast(i) > smaSlow(i));
-    end
-
-    % --- Check for Exit (Sell) Signal ---
-    if position == 1 % We are currently in a long position
-        
-        % EXIT RULE: Only exit on a "Death Cross"
-        finalSell = smaSellSignal(i);
-        
-        if finalSell == 1
-            % Sell! (Go flat)
+    else
+        % Sell Overhyped
+        if current_price > (my_fair_value * 1.15)
+            revenue = position * current_price - commission;
+            capital = capital + revenue;
             position = 0;
-            numTrades = numTrades + 1;
-        end
-        
-    % --- Check for Entry (Buy) Signal ---
-    elseif position == 0 % We are currently flat
-        
-        % ENTRY RULE:
-        % 1. The main "Golden Cross" signal
-        % 2. OR, if already in a bull trend, buy on a dip (RSI or Pattern)
-        finalBuy = smaBuySignal(i) | (isBullTrend & (rsiBuySignal(i) | patternBuy));
-        
-        if finalBuy == 1
-            % Buy! (Go long)
-            position = 1;
-            numTrades = numTrades + 1;
+            sell_signals(t) = current_price;
+            trade_log = [trade_log; t, -1, current_price, pe_ratios(t)];
         end
     end
     
-    % Store the position for this day (for performance calculation)
-    positions(i) = position;
-    
+    portfolio_value(t) = capital + (position * current_price);
 end
 
-% --- [FIX] Shift positions by 1 day (replaces lag) ---
-% Our position at the end of day 'i' (positions(i)) determines the
-% return we get for day 'i+1'.
-positions_lagged = [0; positions(1:end-1)];
+%% --- 3. BENCHMARK ---
+bh_shares = floor((initial_capital - commission) / market_price(1));
+bh_value = (initial_capital - (bh_shares*market_price(1)+commission)) + (bh_shares .* market_price);
 
+%% --- 4. REPORTING ---
+% A. Fundamental Data Sheet
+DataSheet = table(dates, round(earnings,2), round(pe_ratios,1), ...
+    round(estimated_fair_value,2), round(market_price,2), ...
+    'VariableNames', {'Day', 'EPS_Earnings', 'PE_Ratio', 'Calc_Fair_Value', 'MarketPrice'});
 
-%% 7. Calculate Performance
-fprintf('Calculating performance metrics...\n');
+fprintf('--- FUNDAMENTAL DATA SHEET (First 10 Days) ---\n');
+disp(head(DataSheet, 10));
 
-% --- [FIX] Calculate daily returns (replaces lag) ---
-prices_lagged = [NaN; prices(1:end-1)];
-dailyReturns_BH = (prices - prices_lagged) ./ prices_lagged;
-dailyReturns_BH(1) = 0; % First day return is 0
-dailyReturns_BH(isnan(dailyReturns_BH)) = 0;
+% B. Metrics
+algo_return = ((portfolio_value(end) - initial_capital) / initial_capital) * 100;
+bh_return = ((bh_value(end) - initial_capital) / initial_capital) * 100;
 
-% Calculate strategy returns (only earn returns when in position)
-strategyReturns = positions_lagged .* dailyReturns_BH;
-strategyReturns(isnan(strategyReturns)) = 0;
+fprintf('--- PERFORMANCE ---\n');
+fprintf('Algo Return:     %.2f%%\n', algo_return);
+fprintf('Buy&Hold Return: %.2f%%\n', bh_return);
+fprintf('Total Trades:    %d\n', size(trade_log,1));
 
-% Calculate cumulative returns
-cumReturns_BH = cumprod(1 + dailyReturns_BH) - 1;
-cumReturns_Strategy = cumprod(1 + strategyReturns) - 1;
+% C. Dark Mode Visualization
+figure('Name', 'P/E Value Strategy', 'Color', 'k', 'Position', [100, 100, 1000, 600]);
 
-% --- [NEW] Calculate Advanced Metrics ---
-numDays = length(prices);
-tradingDaysPerYear = 252; % Assume 252 trading days
-
-% Total Return
-totalReturn_BH = cumReturns_BH(end);
-totalReturn_Strategy = cumReturns_Strategy(end);
-
-% Annualized Volatility
-volatility_BH = std(dailyReturns_BH) * sqrt(tradingDaysPerYear);
-volatility_Strategy = std(strategyReturns) * sqrt(tradingDaysPerYear);
-
-% Annualized Sharpe Ratio (Risk-Free Rate = 0)
-% Handle case where volatility is 0 (no trades/no returns)
-mean_return_BH = mean(dailyReturns_BH);
-mean_return_Strategy = mean(strategyReturns);
-
-if volatility_BH == 0
-    sharpe_BH = 0;
-else
-    sharpe_BH = (mean_return_BH * tradingDaysPerYear) / volatility_BH;
-end
-
-if volatility_Strategy == 0
-    sharpe_Strategy = 0;
-else
-    sharpe_Strategy = (mean_return_Strategy * tradingDaysPerYear) / volatility_Strategy;
-end
-
-
-% Max Drawdown
-equity_curve = (1 + cumReturns_Strategy);
-high_water_mark = ones(numDays, 1);
-drawdown = zeros(numDays, 1);
-for t = 2:numDays
-    high_water_mark(t) = max(high_water_mark(t-1), equity_curve(t));
-    drawdown(t) = (equity_curve(t) / high_water_mark(t)) - 1;
-end
-maxDrawdown = min(drawdown);
-
-
-% --- [NEW] Print Detailed Results ---
-fprintf('\n--- BACKTEST RESULTS (%.f days) ---\n', numDays);
-fprintf('Total Trades: %d\n', numTrades);
-if yoloErrors > 0
-    fprintf('YOLO Errors: %d\n', yoloErrors);
-end
-
-fprintf('\n--- Strategy Performance ---\n');
-fprintf('Total Return:     % .2f%%\n', totalReturn_Strategy * 100);
-fprintf('Ann. Volatility:  % .2f%%\n', volatility_Strategy * 100);
-fprintf('Ann. Sharpe Ratio:% .2f\n', sharpe_Strategy);
-fprintf('Max Drawdown:     % .2f%%\n', maxDrawdown * 100);
-
-fprintf('\n--- Buy & Hold Performance ---\n');
-fprintf('Total Return:     % .2f%%\n', totalReturn_BH * 100);
-fprintf('Ann. Volatility:  % .2f%%\n', volatility_BH * 100);
-fprintf('Ann. Sharpe Ratio:% .2f\n', sharpe_BH);
-fprintf('--------------------------------------\n');
-
-
-%% 8. Plot Results
-fprintf('Plotting results...\n');
-tradingDays = (1:numPoints)';
-
-figure('Name', 'Backtest Results', 'NumberTitle', 'off', 'Units','normalized','Position',[0.1 0.1 0.8 0.8]);
-
-% --- [NEW] Plot 1: Price and Signals (Top Plot) ---
-subplot(2, 1, 1);
-plot(tradingDays, prices, 'k', 'LineWidth', 1.5);
-hold on;
-plot(tradingDays, smaFast, 'c-', 'LineWidth', 1);
-plot(tradingDays, smaSlow, 'm-', 'LineWidth', 1.5);
-
-% Find buy and sell points
-buyPoints = (positions == 1) & (positions_lagged == 0);
-sellPoints = (positions == 0) & (positions_lagged == 1);
-
-% Plot buy/sell markers
-plot(tradingDays(buyPoints), prices(buyPoints), 'g^', 'MarkerSize', 10, 'MarkerFaceColor', 'g');
-plot(tradingDays(sellPoints), prices(sellPoints), 'rv', 'MarkerSize', 10, 'MarkerFaceColor', 'r');
-
-title('Strategy: Price, SMAs, and Trades');
-legend('Asset Price', 'SMA Fast', 'SMA Slow', 'Buy Signal', 'Sell Signal', 'Location', 'northwest');
-ylabel('Price ($)');
-xlabel('Trading Day');
+% Subplot 1: Price vs Fair Value
+subplot(2,1,1);
+plot(dates, market_price, 'w-', 'LineWidth', 1); hold on;
+plot(dates, estimated_fair_value, 'c--', 'LineWidth', 1.5);
+plot(dates, buy_signals, 'g^', 'MarkerSize', 8, 'MarkerFaceColor', 'g');
+plot(dates, sell_signals, 'rv', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+title('Price vs. Estimated Fair Value (Earnings * 20)', 'Color', 'w');
+legend('Market Price', 'Fair Value (EPS * 20)', 'Buy', 'Sell', 'TextColor', 'w');
+ylabel('Price ($)', 'Color', 'w');
 grid on;
-ax = gca;
-ax.XAxis.Limits = [0 numPoints];
+set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
 
-
-% --- [NEW] Plot 2: Equity Curve (Bottom Plot) ---
-subplot(2, 1, 2);
-h1 = plot(tradingDays, cumReturns_Strategy * 100, 'b', 'LineWidth', 2);
-hold on;
-h2 = plot(tradingDays, cumReturns_BH * 100, 'Color', [0.5 0.5 0.5], 'LineWidth', 1.5); % Grey color
-title('Strategy Performance: Cumulative Return');
-legend([h1, h2], 'SMA Strategy', 'Buy-and-Hold', 'Location', 'northwest');
-ylabel('Return (%)');
-xlabel('Trading Day');
+% Subplot 2: The P/E Ratio (The Valuation Metric)
+subplot(2,1,2);
+yline(20, 'w--', 'Fair P/E (20)'); hold on;
+plot(dates, pe_ratios, 'm-', 'LineWidth', 1);
+yline(17, 'g-', 'Buy Zone (<17)');
+yline(23, 'r-', 'Sell Zone (>23)');
+title('Valuation Metric: P/E Ratio', 'Color', 'w');
+ylabel('P/E Ratio', 'Color', 'w');
+xlabel('Day', 'Color', 'w');
 grid on;
-ax = gca;
-ax.XAxis.Limits = [0 numPoints];
-
-
-fprintf('Done.\n');
+set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
