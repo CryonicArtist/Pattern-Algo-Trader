@@ -1,144 +1,195 @@
-%% MATLAB Realistic P/E Algo Trader
-% Strategy: Buy when Price-to-Earnings (P/E) is historically low.
-%           Sell when P/E is historically high.
-% NO "God Mode" - The bot trades based on public Earnings data only.
+%% MATLAB "Sniper" Algo Trader (RSI + Limit Orders)
+% Strategy: "Catch the Bottom"
+%   1. Calculate "Fair Value" (20-Day EMA)
+%   2. Place a LIMIT ORDER at the Lower Bollinger Band.
+%   3. If RSI is < 40 (Oversold), we execute the trade aggressively.
+%   4. Compare performance against a passive "Buy & Hold" strategy.
 
 clear; clc; close all;
 
-%% --- 1. PARAMETERS & DATA GENERATION ---
-days = 252 * 5;      % 5 Years
-start_earn = 5.00;   % Starting Earnings Per Share (EPS)
-avg_pe = 20;         % The "Fair" P/E Ratio
-volatility = 0.02;   % Volatility of the company earnings
+%% --- 1. DATA GENERATION (Simulating High/Low/Close) ---
+% We simulate 'High' and 'Low' prices to allow for "Wick" trading
+days = 252 * 3;      % 3 Years
+start_price = 150;   
+mu = 0.0005;         % Drift (General upward trend)
+sigma = 0.02;        % Volatility (Market noise)
 
-% Pre-allocate
 dates = (1:days)';
-earnings = zeros(days, 1);
-market_price = zeros(days, 1);
-pe_ratios = zeros(days, 1);
+close_price = zeros(days, 1);
+high_price = zeros(days, 1);
+low_price = zeros(days, 1);
+close_price(1) = start_price;
 
-% Initialize
-earnings(1) = start_earn;
-% Market starts at "Fair Value"
-market_price(1) = start_earn * avg_pe; 
-pe_ratios(1) = avg_pe;
-
-% Generate Data
-rng('shuffle'); 
-current_pe_sentiment = avg_pe; % Starts at 20
-
+rng('shuffle'); % Random seed
 for t = 2:days
-    % 1. Generate Earnings (Random Walk with slight upward drift)
-    % Earnings grow slowly (0.05% per day) but have noise
-    earnings(t) = earnings(t-1) * (1 + 0.0005 + randn * 0.01); 
+    % Generate Close Price
+    shock = randn;
+    close_price(t) = close_price(t-1) * exp((mu - 0.5 * sigma^2) + sigma * shock);
     
-    % 2. Generate Market Sentiment (P/E Ratio)
-    % Sentiment swings like a pendulum around the average of 20
-    sentiment_shock = randn * 0.5; 
-    % Mean reversion strength (pulls P/E back to 20)
-    pull_back = (avg_pe - current_pe_sentiment) * 0.05; 
-    current_pe_sentiment = current_pe_sentiment + pull_back + sentiment_shock;
-    
-    % 3. Calculate Price
-    % Price = Earnings * P/E Ratio
-    market_price(t) = earnings(t) * current_pe_sentiment;
-    pe_ratios(t) = current_pe_sentiment;
+    % Simulate High and Low (Wicks)
+    % High is typically 0.5% to 3% above close/open
+    daily_vol = rand * 0.03; 
+    high_price(t) = close_price(t) * (1 + daily_vol);
+    low_price(t) = close_price(t) * (1 - daily_vol);
 end
 
-%% --- 2. STRATEGY (REALISTIC) ---
+%% --- 2. INDICATORS (RSI + Bollinger) ---
+window = 20;
+std_devs = 2.0; 
+
+% A. Exponential Moving Average (Faster than SMA)
+ema = zeros(days, 1);
+k = 2 / (window + 1);
+ema(1) = close_price(1);
+for t = 2:days
+    ema(t) = close_price(t) * k + ema(t-1) * (1 - k);
+end
+
+% B. Bollinger Bands
+upper_band = zeros(days, 1);
+lower_band = zeros(days, 1);
+for t = window:days
+    slice = close_price(t-window+1 : t);
+    stdev = std(slice);
+    upper_band(t) = ema(t) + (std_devs * stdev);
+    lower_band(t) = ema(t) - (std_devs * stdev);
+end
+
+% C. RSI (Relative Strength Index)
+rsi_period = 14;
+rsi = zeros(days, 1);
+change = [0; diff(close_price)];
+avg_gain = 0; avg_loss = 0;
+
+% Initial RSI Calculation
+for t = 2:rsi_period+1
+    gain = max(0, change(t));
+    loss = abs(min(0, change(t)));
+    avg_gain = avg_gain + gain;
+    avg_loss = avg_loss + loss;
+end
+avg_gain = avg_gain / rsi_period;
+avg_loss = avg_loss / rsi_period;
+
+for t = rsi_period+2:days
+    gain = max(0, change(t));
+    loss = abs(min(0, change(t)));
+    
+    avg_gain = (avg_gain * (rsi_period-1) + gain) / rsi_period;
+    avg_loss = (avg_loss * (rsi_period-1) + loss) / rsi_period;
+    
+    rs = avg_gain / avg_loss;
+    rsi(t) = 100 - (100 / (1 + rs));
+end
+
+%% --- 3. TRADING LOGIC (THE SNIPER) ---
 initial_capital = 10000;
 capital = initial_capital;
 position = 0; 
-commission = 5; 
-
 portfolio_value = zeros(days, 1);
-buy_signals = nan(days, 1);
-sell_signals = nan(days, 1);
+buy_signals = nan(days, 1); 
+sell_signals = nan(days, 1); 
 trade_log = [];
 
-% Estimated Fair Value (This is the Bot's "Prediction")
-% The bot assumes the stock is always worth 20x Earnings.
-estimated_fair_value = earnings * avg_pe;
+% Warmup Period: We cannot trade before indicators exist
+for t = 1:window
+    portfolio_value(t) = initial_capital;
+end
 
-for t = 1:days
-    current_price = market_price(t);
-    my_fair_value = estimated_fair_value(t); % Earnings * 20
+for t = window+1 : days
+    current_close = close_price(t);
     
-    % Logic: 
-    % If Price is 15% below Fair Value (P/E < 17) -> BUY
-    % If Price is 15% above Fair Value (P/E > 23) -> SELL
+    % Target Buy Price = The Lower Band (The "Discount" Price)
+    limit_buy_order = lower_band(t);
     
+    % --- BUY LOGIC (Limit Order) ---
     if position == 0
-        % Buy Deep Value
-        if current_price < (my_fair_value * 0.85) 
-            shares = floor((capital - commission) / current_price);
+        % Check 1: Did the price wick down to our limit order?
+        % Check 2: Is RSI Oversold (< 40) to confirm the dip is real?
+        if (low_price(t) <= limit_buy_order) && (rsi(t) < 40)
+            
+            % EXECUTION: We buy at the LIMIT PRICE, not the Close.
+            execution_price = limit_buy_order; 
+            
+            shares = floor(capital / execution_price);
             if shares > 0
-                cost = shares * current_price + commission;
-                capital = capital - cost;
+                capital = capital - (shares * execution_price);
                 position = shares;
-                buy_signals(t) = current_price;
-                trade_log = [trade_log; t, 1, current_price, pe_ratios(t)];
+                buy_signals(t) = execution_price;
+                trade_log = [trade_log; t, 1, execution_price]; 
             end
         end
-    else
-        % Sell Overhyped
-        if current_price > (my_fair_value * 1.15)
-            revenue = position * current_price - commission;
-            capital = capital + revenue;
+        
+    % --- SELL LOGIC (Take Profit) ---
+    elseif position > 0
+        % Sell if we hit the upper band OR if RSI gets too hot (> 75)
+        if (high_price(t) >= upper_band(t)) || (rsi(t) > 75)
+            % We sell at the Close or the Band, whichever is achievable
+            execution_price = max(upper_band(t), current_close);
+            
+            capital = capital + (position * execution_price);
             position = 0;
-            sell_signals(t) = current_price;
-            trade_log = [trade_log; t, -1, current_price, pe_ratios(t)];
+            sell_signals(t) = execution_price;
+            trade_log = [trade_log; t, -1, execution_price]; 
         end
     end
     
-    portfolio_value(t) = capital + (position * current_price);
+    % Mark to Market (Daily Account Value)
+    portfolio_value(t) = capital + (position * current_close);
 end
 
-%% --- 3. BENCHMARK ---
-bh_shares = floor((initial_capital - commission) / market_price(1));
-bh_value = (initial_capital - (bh_shares*market_price(1)+commission)) + (bh_shares .* market_price);
+%% --- 4. BENCHMARK: BUY & HOLD ---
+% We start Buy & Hold on Day (window+1) to be fair (same start time as Algo)
+start_index = window + 1;
+bh_shares = floor(initial_capital / close_price(start_index));
+bh_cash_remainder = initial_capital - (bh_shares * close_price(start_index));
 
-%% --- 4. REPORTING ---
-% A. Fundamental Data Sheet
-DataSheet = table(dates, round(earnings,2), round(pe_ratios,1), ...
-    round(estimated_fair_value,2), round(market_price,2), ...
-    'VariableNames', {'Day', 'EPS_Earnings', 'PE_Ratio', 'Calc_Fair_Value', 'MarketPrice'});
+% Calculate BH Value over time
+bh_curve = zeros(days, 1);
+bh_curve(1:window) = initial_capital; % Flat during warmup
+bh_curve(window+1:end) = bh_cash_remainder + (bh_shares .* close_price(window+1:end));
 
-fprintf('--- FUNDAMENTAL DATA SHEET (First 10 Days) ---\n');
-disp(head(DataSheet, 10));
-
-% B. Metrics
+%% --- 5. REPORTING & METRICS ---
 algo_return = ((portfolio_value(end) - initial_capital) / initial_capital) * 100;
-bh_return = ((bh_value(end) - initial_capital) / initial_capital) * 100;
+bh_return = ((bh_curve(end) - initial_capital) / initial_capital) * 100;
 
-fprintf('--- PERFORMANCE ---\n');
-fprintf('Algo Return:     %.2f%%\n', algo_return);
-fprintf('Buy&Hold Return: %.2f%%\n', bh_return);
-fprintf('Total Trades:    %d\n', size(trade_log,1));
+fprintf('\n--- PERFORMANCE REPORT ---\n');
+fprintf('Initial Capital:  $%.2f\n', initial_capital);
+fprintf('Final Algo Value: $%.2f\n', portfolio_value(end));
+fprintf('Final B&H Value:  $%.2f\n', bh_curve(end));
+fprintf('--------------------------\n');
+fprintf('Algo Return:      %.2f%%\n', algo_return);
+fprintf('Buy&Hold Return:  %.2f%%\n', bh_return);
+fprintf('Total Trades:     %d\n', size(trade_log,1));
 
-% C. Dark Mode Visualization
-figure('Name', 'P/E Value Strategy', 'Color', 'k', 'Position', [100, 100, 1000, 600]);
+if algo_return > bh_return
+    fprintf('RESULT: Algo BEAT the market by %.2f%%\n', algo_return - bh_return);
+else
+    fprintf('RESULT: Algo LOST to the market by %.2f%%\n', bh_return - algo_return);
+end
 
-% Subplot 1: Price vs Fair Value
-subplot(2,1,1);
-plot(dates, market_price, 'w-', 'LineWidth', 1); hold on;
-plot(dates, estimated_fair_value, 'c--', 'LineWidth', 1.5);
-plot(dates, buy_signals, 'g^', 'MarkerSize', 8, 'MarkerFaceColor', 'g');
-plot(dates, sell_signals, 'rv', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
-title('Price vs. Estimated Fair Value (Earnings * 20)', 'Color', 'w');
-legend('Market Price', 'Fair Value (EPS * 20)', 'Buy', 'Sell', 'TextColor', 'w');
-ylabel('Price ($)', 'Color', 'w');
-grid on;
+%% --- 6. VISUALIZATION ---
+figure('Name', 'Sniper Strategy vs Buy & Hold', 'Color', 'k', 'Position', [100, 100, 1200, 800]);
+
+% Subplot 1: Price Actions & Executions
+subplot(3,1,1:2);
+plot(dates, upper_band, 'r-', 'LineWidth', 0.5); hold on;
+plot(dates, lower_band, 'g-', 'LineWidth', 0.5);
+plot(dates, close_price, 'w-', 'LineWidth', 1);
+plot(dates, buy_signals, 'g^', 'MarkerSize', 10, 'MarkerFaceColor', 'g');
+plot(dates, sell_signals, 'rv', 'MarkerSize', 10, 'MarkerFaceColor', 'r');
+title('Sniper Strategy (Limit Order Entries)', 'Color', 'w');
+legend('Sell Zone', 'Buy Zone', 'Price', 'Sniper Buy', 'Sell Signal', 'TextColor', 'w', 'Color', 'k');
 set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
-
-% Subplot 2: The P/E Ratio (The Valuation Metric)
-subplot(2,1,2);
-yline(20, 'w--', 'Fair P/E (20)'); hold on;
-plot(dates, pe_ratios, 'm-', 'LineWidth', 1);
-yline(17, 'g-', 'Buy Zone (<17)');
-yline(23, 'r-', 'Sell Zone (>23)');
-title('Valuation Metric: P/E Ratio', 'Color', 'w');
-ylabel('P/E Ratio', 'Color', 'w');
-xlabel('Day', 'Color', 'w');
 grid on;
+
+% Subplot 2: Equity Curve Comparison
+subplot(3,1,3);
+area(dates, portfolio_value, 'FaceColor', [0 0.5 0], 'FaceAlpha', 0.4, 'EdgeColor', 'g'); hold on;
+plot(dates, bh_curve, 'w--', 'LineWidth', 1.5); % White dashed line for B&H
+title('Account Growth: Algo vs. Buy & Hold', 'Color', 'w');
+legend('Algo Equity', 'Buy & Hold Equity', 'Location', 'best', 'TextColor', 'w', 'Color', 'k');
+ylabel('Value ($)', 'Color', 'w');
+xlabel('Trading Days', 'Color', 'w');
 set(gca, 'Color', 'k', 'XColor', 'w', 'YColor', 'w');
+grid on;
