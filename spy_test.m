@@ -2,7 +2,7 @@
 clear; clc; close all;
 
 % --- USER CONFIGURATION ---
-fileName = 'marketdata.csv'; 
+fileName = '1marketdata.csv'; 
 % IMPORTANT: Change this date to one that exists in your CSV!
 targetDate = datetime(2023, 10, 25); 
 initialCapital = 10000;
